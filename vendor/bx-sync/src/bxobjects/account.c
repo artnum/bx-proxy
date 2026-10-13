@@ -1,0 +1,148 @@
+#include "../include/bxobjects/account.h"
+#include "../include/bx_database.h"
+#include "../include/bx_object.h"
+#include "../include/bx_sync_one.h"
+#include "../include/bx_utils.h"
+#include "../include/bx_walk.h"
+#include <jansson.h>
+#include <stdio.h>
+#include <time.h>
+
+#define QUERY_INSERT                                                           \
+  "INSERT INTO account (id, uuid, account_no, name, account_type, tax_id, "    \
+  "fibu_account_group_id, is_active, is_locked, _checksum, _last_updated, "    \
+  "_deleted) VALUES (:id, :uuid, :account_no, :name, :account_type, :tax_id, " \
+  ":fibu_account_group_id, :is_active, :is_locked, :_checksum, "               \
+  ":_last_updated, :_deleted)"
+#define QUERY_UPDATE                                                           \
+  "UPDATE account SET uuid = :uuid, account_no = :account_no, name = :name, "  \
+  "account_type = :account_type, tax_id = :tax_id, "                           \
+  "fibu_account_group_id = :fibu_account_group_id, is_active = :is_active, "   \
+  "is_locked = :is_locked, _checksum = :_checksum, "                           \
+  "_last_updated = :_last_updated, _deleted = :_deleted WHERE id = :id"
+
+static void free_content(BXObjectAccount *a) {
+  bx_object_free_value(&a->account_no);
+  bx_object_free_value(&a->name);
+}
+
+static BXObjectAccount *decode_object(json_t *object) {
+  BXObjectAccount *account = calloc(1, sizeof(*account));
+  if (account == NULL) {
+    return NULL;
+  }
+  XXH3_state_t *hash_state = XXH3_createState();
+  if (hash_state == NULL) {
+    free(account);
+    return NULL;
+  }
+  XXH3_64bits_reset(hash_state);
+  account->type = BXTypeAccount;
+  bxo_getuint(account, id);
+  bxo_getuuid(account, uuid);
+  bxo_getstr(account, account_no);
+  bxo_getstr(account, name);
+  bxo_getint(account, account_type);
+  bxo_getuint(account, tax_id);
+  bxo_getuint(account, fibu_account_group_id);
+  bxo_getbool(account, is_active);
+  bxo_getbool(account, is_locked);
+  bxo_checksum(account);
+  return account;
+}
+
+static BXillError persist(MYSQL *conn, BXObjectAccount *account) {
+  BXDatabaseQuery *query = bx_database_new_query(
+      conn, "SELECT _checksum FROM account WHERE id = :id");
+  if (query == NULL) {
+    return ErrorGeneric;
+  }
+  bx_database_add_bxtype(query, ":id", (BXGeneric *)&account->id);
+  if (!bx_database_execute(query) || !bx_database_results(query)) {
+    BXillError e = query->need_reconnect ? ErrorSQLReconnect : ErrorGeneric;
+    bx_database_free_query(query);
+    return e;
+  }
+  int need_insert =
+      (query->results == NULL || query->results->column_count == 0);
+  if (!need_insert &&
+      (uint64_t)query->results->columns[0].i_value == account->checksum) {
+    bx_database_free_query(query);
+    return NoError;
+  }
+  bx_database_free_query(query);
+
+  query = bx_database_new_query(conn, need_insert ? QUERY_INSERT : QUERY_UPDATE);
+  if (query == NULL) {
+    return ErrorGeneric;
+  }
+  uint64_t now = (uint64_t)time(NULL);
+  uint64_t not_deleted = 0;
+  if (!bxd_bind(account, id) || !bxd_bind(account, uuid) ||
+      !bxd_bind(account, account_no) || !bxd_bind(account, name) ||
+      !bxd_bind(account, account_type) || !bxd_bind(account, tax_id) ||
+      !bxd_bind(account, fibu_account_group_id) ||
+      !bxd_bind(account, is_active) || !bxd_bind(account, is_locked) ||
+      !bx_database_add_param_uint64(query, ":_checksum", &account->checksum) ||
+      !bx_database_add_param_uint64(query, ":_last_updated", &now) ||
+      !bx_database_add_param_uint64(query, ":_deleted", &not_deleted)) {
+    bx_database_free_query(query);
+    return ErrorGeneric;
+  }
+  if (!bx_database_execute(query) || !bx_database_results(query)) {
+    BXillError e = query->need_reconnect ? ErrorSQLReconnect : ErrorGeneric;
+    bx_database_free_query(query);
+    return e;
+  }
+  bx_database_free_query(query);
+  return NoError;
+}
+
+static BXillError account_page_item(bXill *app, MYSQL *conn, json_t *item,
+                                    void *ctx) {
+  (void)app;
+  (void)ctx;
+  BXObjectAccount *account = decode_object(item);
+  if (account == NULL) {
+    return ErrorGeneric;
+  }
+  BXillError e = persist(conn, account);
+  free_content(account);
+  free(account);
+  return e;
+}
+
+BXillError bx_account_walk_items(bXill *app, MYSQL *conn) {
+  bx_log_debug("BX Walk Account Items");
+  return bx_walk_pages(app, conn, "2.0/accounts?limit=$&offset=$", NULL, NULL,
+                       account_page_item, NULL);
+}
+
+BXillError bx_account_sync_id(bXill *app, MYSQL *conn, uint64_t id) {
+  char key[32];
+  BXNetRequest *req = NULL;
+  json_t *obj = NULL;
+  BXObjectAccount *account = NULL;
+  BXillError e = NoError;
+
+  snprintf(key, sizeof(key), "%llu", (unsigned long long)id);
+  e = bx_http_get_json(app, "2.0/accounts/$", key, &req);
+  if (e != NoError) {
+    return e;
+  }
+  obj = bx_json_unwrap_object(req->decoded);
+  if (obj == NULL) {
+    bx_net_request_free(req);
+    return ErrorJSON;
+  }
+  account = decode_object(obj);
+  if (account == NULL) {
+    bx_net_request_free(req);
+    return ErrorJSON;
+  }
+  e = persist(conn, account);
+  free_content(account);
+  free(account);
+  bx_net_request_free(req);
+  return e;
+}

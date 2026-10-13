@@ -1,0 +1,411 @@
+#include "include/bx_utils.h"
+#include "include/bx_decode.h"
+#include "include/bx_mutex.h"
+#include "include/bx_net.h"
+#include "include/bx_object_value.h"
+#include "include/bxill.h"
+#include <assert.h>
+#include <fcntl.h>
+#include <jansson.h>
+#include <stdarg.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/time.h>
+#include <threads.h>
+#include <time.h>
+#include <unistd.h>
+
+#define SNOWFLAKE_IMPLEMENTATION
+#define SF_S_NAME "bxsync"
+#include "../snowflake-c/snowflake.h"
+
+static snowflake_ctx_t snflk;
+bool bx_utils_init(void) {
+    return snowflake_open(&snflk, 0);
+}
+
+bool bx_utils_gen_id(uint64_t *id) {
+  assert(id != NULL);
+
+  *id = snowflake_get(&snflk);
+  if (*id == SNOWFLAKE_INVALID) {
+    return false;
+  }
+
+  return true;
+}
+
+void bx_utils_close(void) {
+    snowflake_close(&snflk);
+}
+
+static inline void _bx_utils_buffer_into_array(int64_t **array, char *buffer) {
+  int64_t n = strtoll(buffer, NULL, 10);
+  void *tmp = *array == NULL ? calloc(2, sizeof(**array))
+                             : realloc(*array, (**array + 2) * sizeof(**array));
+  if (tmp == NULL) {
+    return;
+  }
+  *array = tmp;
+  *(*array + ++**array) = n;
+}
+
+int64_t *bx_int_string_array_to_int_array(const char *str) {
+  char buffer[21]; /* up to 64 bits */
+  int64_t *int_array = NULL;
+
+  if (str == NULL) {
+    return NULL;
+  }
+  memset(buffer, 0, 21);
+  int j = 0;
+  for (int i = 0; str[i] != '\0'; i++) {
+    switch (str[i]) {
+    case '0':
+    case '1':
+    case '2':
+    case '3':
+    case '4':
+    case '5':
+    case '6':
+    case '7':
+    case '8':
+    case '9':
+      if (j > 20) {
+        break;
+      }
+      buffer[j++] = str[i];
+      break;
+    default:
+      if (j <= 0) {
+        break;
+      }
+      _bx_utils_buffer_into_array(&int_array, buffer);
+      memset(buffer, 0, 21);
+      j = 0;
+      break;
+    }
+  }
+  if (j > 0) {
+    _bx_utils_buffer_into_array(&int_array, buffer);
+  }
+  return int_array;
+}
+
+static inline char *_bx_item_to_path(const char *fmt, va_list ap) {
+  assert(fmt != NULL);
+  size_t fmt_len = strlen(fmt);
+  assert(fmt_len > 0);
+
+  char *path = NULL;
+  size_t path_len =
+      0; // Tracks total length of path (excluding null terminator)
+  size_t origin = 0;
+  size_t i = 0;
+
+  for (i = 0; i < fmt_len; i++) {
+    if (fmt[i] == '$') {
+      BXGeneric *item = va_arg(ap, BXGeneric *);
+      if (item == NULL) {
+        free(path);
+        return NULL;
+      }
+      char *str = bx_object_value_to_string(item);
+      if (str == NULL) {
+        free(path);
+        return NULL;
+      }
+      size_t str_len = strlen(str);
+      if (str_len == 0) {
+        free(str);
+        free(path);
+        return NULL;
+      }
+
+      // Calculate new length: existing path + new fmt segment + str + null
+      // terminator
+      size_t new_len = path_len + (i - origin) + str_len;
+      char *tmp = realloc(path, new_len + 1); // +1 for null terminator
+      if (tmp == NULL) {
+        free(str);
+        free(path);
+        return NULL;
+      }
+      path = tmp;
+
+      // Copy fmt segment and str directly using memcpy
+      if (i > origin) {
+        memcpy(path + path_len, &fmt[origin], i - origin);
+        path_len += i - origin;
+      }
+      memcpy(path + path_len, str, str_len);
+      path_len += str_len;
+      path[path_len] = '\0'; // Null-terminate
+
+      free(str);
+      origin = i + 1;
+    }
+  }
+
+  // Append any remaining fmt segment
+  if (i > origin) {
+    size_t new_len = path_len + (i - origin);
+    char *tmp = realloc(path, new_len + 1); // +1 for null terminator
+    if (tmp == NULL) {
+      free(path);
+      return NULL;
+    }
+    path = tmp;
+
+    memcpy(path + path_len, &fmt[origin], i - origin);
+    path_len += i - origin;
+    path[path_len] = '\0'; // Null-terminate
+  }
+
+  return path;
+}
+
+char *bx_item_to_path(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  char *ret = _bx_item_to_path(fmt, ap);
+  va_end(ap);
+  return ret;
+}
+
+static BXNetRequest *bx_do_request_wait(BXNetRequestList *queue, json_t *body,
+                                        char *path_fmt, va_list ap) {
+  (void)body;
+  BXNetRequest *request = NULL;
+  assert(path_fmt != NULL);
+  assert(queue != NULL);
+
+  char *path = _bx_item_to_path(path_fmt, ap);
+  if (path == NULL) {
+    bx_log_debug("Request parsing faile %s", path_fmt);
+    return NULL;
+  }
+
+  bx_log_debug("path %s", path);
+  request = bx_net_request_new(path, NULL);
+  free(path);
+  if (request == NULL) {
+    return NULL;
+  }
+
+  uint64_t request_id = bx_net_request_list_add(queue, request);
+  if (request_id == 0) {
+    bx_net_request_free(request);
+    return NULL;
+  }
+  request = bx_net_request_list_get_finished(queue, request_id);
+  if (request == NULL) {
+    return NULL;
+  }
+  thrd_yield();
+  if (request->cancel || request->response == NULL) {
+    bx_net_request_free(request);
+    return NULL;
+  }
+  return request;
+}
+
+BXNetRequest *bx_do_request(BXNetRequestList *queue, json_t *body,
+                            char *path_fmt, ...) {
+  va_list ap;
+  va_start(ap, path_fmt);
+  BXNetRequest *request = bx_do_request_wait(queue, body, path_fmt, ap);
+  va_end(ap);
+  if (request == NULL) {
+    return NULL;
+  }
+  json_t *json = bx_decode_net(request);
+  if (json == NULL) {
+    bx_net_request_free(request);
+    return NULL;
+  }
+  request->decoded = json;
+  return request;
+}
+
+BXNetRequest *bx_do_request_raw(BXNetRequestList *queue, json_t *body,
+                                char *path_fmt, ...) {
+  va_list ap;
+  va_start(ap, path_fmt);
+  BXNetRequest *request = bx_do_request_wait(queue, body, path_fmt, ap);
+  va_end(ap);
+  return request;
+}
+
+struct s_BXLog LOG;
+
+#define LOG_FILE "/var/log/bxsync.log"
+bool bx_log_init(bXill *app, const char *path, int level) {
+  assert(app != NULL);
+
+  LOG.head = NULL;
+  LOG.level = level;
+  if (path == NULL) {
+    LOG.path = strdup(LOG_FILE);
+  } else {
+    LOG.path = strdup(path);
+  }
+  LOG.app = app;
+  bx_mutex_init(&LOG.mutex);
+  LOG.fp = fopen(LOG.path, "a");
+  if (!LOG.fp) {
+    return false;
+  }
+  return true;
+}
+
+/* direct write to log file, only in init phase */
+void bx_log_write(const char *msg) { fprintf(LOG.fp, "%s\n", msg); }
+/* direct close, only in init phase */
+void bx_log_close() { fclose(LOG.fp); }
+void bx_log_reopen() {
+  bx_log_info("Reloading log file, closing current");
+  pthread_mutex_lock(&LOG.mutex);
+  if (LOG.fp) {
+    fflush(LOG.fp);
+    fclose(LOG.fp);
+  }
+  LOG.fp = fopen(LOG.path, "a");
+  if (!LOG.fp) {
+    atomic_store(&LOG.app->logthread, false);
+  }
+  pthread_mutex_unlock(&LOG.mutex);
+  bx_log_info("Reloading log file, opening new one");
+}
+
+void *bx_log_out_thread(void *arg) {
+  bXill *app = (bXill *)arg;
+  struct s_BXLogMsg *current = NULL;
+  while (atomic_load(&app->logthread)) {
+    bx_mutex_lock(&LOG.mutex);
+    current = LOG.head;
+    LOG.head = NULL;
+
+    struct s_BXLogMsg *reversed = NULL;
+    while (current) {
+      struct s_BXLogMsg *next = (struct s_BXLogMsg *)current->next;
+      current->next = reversed;
+      reversed = current;
+      current = next;
+    }
+
+    current = reversed;
+    while (current) {
+      struct s_BXLogMsg *next = (struct s_BXLogMsg *)current->next;
+      if (LOG.fp) {
+        fprintf(LOG.fp, "%s\n", current->msg);
+      }
+      free(current);
+      current = next;
+    }
+    fflush(LOG.fp);
+    bx_mutex_unlock(&LOG.mutex);
+    current = NULL;
+    thrd_sleep(&(struct timespec){.tv_sec = 0, .tv_nsec = 1000000}, NULL);
+  }
+
+  bx_mutex_lock(&LOG.mutex);
+  current = LOG.head;
+  struct s_BXLogMsg *next = NULL;
+  while (current) {
+    next = (struct s_BXLogMsg *)current->next;
+    fprintf(LOG.fp, "%s\n", current->msg);
+    free(current);
+    current = next;
+  }
+  fprintf(LOG.fp, "--- END OF LOG THREAD ---\n");
+  fflush(LOG.fp);
+  bx_mutex_unlock(&LOG.mutex);
+  return 0;
+}
+
+void _bx_log_queue(char *msg, const char *err, char *file, int line,
+                   pthread_t thid) {
+  struct s_BXLogMsg *new = NULL;
+  new = malloc(sizeof(*new));
+  if (new == NULL) {
+    return;
+  }
+  if (err == NULL) {
+    snprintf(new->msg, LOG_MSG_BUFFER_MAX, "[%ld] %s", time(NULL), msg);
+  } else {
+    snprintf(new->msg, LOG_MSG_BUFFER_MAX, "[%ld] %s (%lX) [%s:%d] %s",
+             time(NULL), err, thid, file, line, msg);
+  }
+  if (bx_mutex_lock(&LOG.mutex) != false) {
+    new->next = LOG.head;
+    LOG.head = new;
+    bx_mutex_unlock(&LOG.mutex);
+  } else {
+    free(new);
+  }
+}
+
+void _bx_log_debug(char *file, int line, pthread_t thid, const char *fmt, ...) {
+  if (LOG.level < LOG_LEVEL_DEBUG) {
+    return;
+  }
+  char x[LOG_MSG_BUFFER_MAX];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(x, LOG_MSG_BUFFER_MAX, fmt, ap);
+  va_end(ap);
+  _bx_log_queue(x, "DEBUG", file, line, thid);
+}
+
+void _bx_log_info(char *file, int line, pthread_t thid, const char *fmt, ...) {
+  if (LOG.level < LOG_LEVEL_INFO) {
+    return;
+  }
+  char x[LOG_MSG_BUFFER_MAX];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(x, LOG_MSG_BUFFER_MAX, fmt, ap);
+  va_end(ap);
+  _bx_log_queue(x, "INFO", file, line, thid);
+}
+
+void _bx_log_error(char *file, int line, pthread_t thid, const char *fmt, ...) {
+  if (LOG.level < LOG_LEVEL_ERROR) {
+    return;
+  }
+  char x[LOG_MSG_BUFFER_MAX];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(x, LOG_MSG_BUFFER_MAX, fmt, ap);
+  va_end(ap);
+  _bx_log_queue(x, "ERROR", file, line, thid);
+}
+
+void bx_log_end() { fclose(LOG.fp); }
+
+bool bx_string_compare(const char *str1, const char *str2, size_t max) {
+  for (size_t i = 0; i < max && *str1 != '\0' && *str2 != '\0'; i++) {
+    if (*str1 != *str2) {
+      return false;
+    }
+    str1++;
+    str2++;
+  }
+  return true;
+}
+
+void bx_walker_cycle_mark(time_t *ts, const char *name) {
+  time_t now = time(NULL);
+  if (now == (time_t)-1) {
+    return;
+  }
+  if (*ts != 0 && now >= *ts) {
+    bx_log_info("Walker %s cycle: %ld s", name, (long)(now - *ts));
+  }
+  *ts = now;
+}

@@ -1,0 +1,17 @@
+{
+  "bexio-endpoint": "https://api.bexio.com/",
+  "oauth-client-id": "the Bexio app client id",
+  "oauth-client-secret": "the Bexio app client secret",
+  "oauth-redirect-uri": "http://127.0.0.1:8765/callback",
+  "mysql-host": "localhost",
+  "mysql-user": "the mysql user",
+  "mysql-password": "the mysql password",
+  "mysql-database": "bxill",
+  "log-file": "path/to/log.log",
+  "log-level": 255,
+  "prune-drift": 10,
+  "cache-directory": "/var/cache/bxsync/files",
+  "listen-host": "127.0.0.1",
+  "listen-port": 8080,
+  "stale-seconds": 7200
+}

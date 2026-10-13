@@ -1,0 +1,55 @@
+#ifndef BX_CONF_H__
+#define BX_CONF_H__
+
+#include "bx_mutex.h"
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct s_BXConf BXConf;
+typedef struct s_BXConfValue BXConfValue;
+
+enum e_BXConfValueType {
+  StringType = 1,
+  ByteType,
+  IntegerType,
+  FloatType,
+  BoolType,
+  BlobType
+};
+
+typedef struct s_BXConfBlob {
+  const void *data;
+  size_t len;
+} BXConfBlob;
+
+struct s_BXConfValue {
+  uint64_t key;
+  enum e_BXConfValueType type;
+  char *s_value;
+  int i_value;
+  double f_value;
+  void *b_value;
+  size_t b_len;
+  BXConfValue *next;
+};
+
+struct s_BXConf {
+  BXConfValue *head;
+};
+
+BXConf *bx_conf_init();
+void bx_conf_destroy(BXConf **conf);
+void bx_conf_dump(BXConf *conf);
+bool bx_conf_set(BXConf *conf, const char *key, void *value,
+                 enum e_BXConfValueType type);
+void bx_conf_release(BXConf *conf, const char *key);
+const char *bx_conf_get_string(BXConf *conf, const char *key);
+int bx_conf_get_int(BXConf *conf, const char *key);
+bool bx_conf_loadfile(BXConf *conf, const char *filepath);
+/* Overlay _configuration. mysql-* names stay as loaded from the file. */
+bool bx_conf_load_database(BXConf *conf);
+/* Insert or replace one row and update the in-memory value. */
+bool bx_conf_put_database(BXConf *conf, const char *name,
+                          enum e_BXConfValueType type, void *value);
+
+#endif /* BX_CONF_H__ */

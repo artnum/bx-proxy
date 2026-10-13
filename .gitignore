@@ -1,0 +1,5 @@
+bx-proxy
+a.out
+build/
+*.o
+tags
